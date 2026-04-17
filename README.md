@@ -1,11 +1,8 @@
-# Hermes Skills Bundle
+# Hermes AI Digest Skill
 
-This repository now includes two production-focused skills:
+[简体中文](./README.zh-CN.md)
 
-1. `hermes-ai-digest`: strict 48-hour overseas AI intelligence digest generation.
-2. `omx-cli-default`: adaptive OMX closed-loop execution for Codex with low-token routing.
-
-The original Hermes digest skill remains the main feature, and the OMX skill is added to standardize execution/feedback handoff.
+Production-oriented Hermes skill for generating strict 48-hour overseas AI intelligence digests with multi-source retrieval, cross-verification, modular reporting, and self-learning feedback.
 
 ## Features
 
@@ -26,9 +23,8 @@ The original Hermes digest skill remains the main feature, and the OMX skill is 
 
 ## Repository Structure
 
-- `SKILL.md`: Hermes digest skill definition
-- `scripts/x_ai_tavily_digest.py`: Hermes digest main pipeline
-- `skills/omx-cli-default/`: Codex OMX routing + close-loop skill
+- `SKILL.md`: skill trigger and instructions
+- `scripts/x_ai_tavily_digest.py`: main pipeline
 - `README.md`: English documentation
 - `README.zh-CN.md`: Chinese documentation
 
