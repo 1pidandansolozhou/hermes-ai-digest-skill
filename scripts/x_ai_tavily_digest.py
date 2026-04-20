@@ -15,13 +15,14 @@ import datetime as dt
 import json
 import math
 import tempfile
+import time
 import os
 import re
 import subprocess
 import sys
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote_plus, urlencode, urlparse
 
 STATUS_RE = re.compile(r"https?://x\.com/([^/]+)/status/(\d+)")
@@ -29,9 +30,24 @@ SNOWFLAKE_EPOCH_MS = 1288834974657
 BJT = dt.timezone(dt.timedelta(hours=8))
 UTC = dt.timezone.utc
 MAX_AGE_HOURS = 48.0
-MAX_REVERSE_CHECK = 32
+MAX_REVERSE_CHECK = int(os.getenv("X_AI_DIGEST_MAX_REVERSE_CHECK", "16"))
 LEARNING_HISTORY_MAX = 40
 LEARNING_STATE_PATH = Path.home() / ".hermes" / "cron" / "state" / "x_ai_digest_learning.json"
+ENABLE_X_SCRAPERS_DEFAULT = False
+MAX_RUNTIME_SECONDS = int(os.getenv("X_AI_DIGEST_MAX_RUNTIME_SECONDS", "70"))
+MAX_OUTPUT_ITEMS = int(os.getenv("X_AI_DIGEST_MAX_ITEMS", "24"))
+MAX_OUTPUT_ERRORS = int(os.getenv("X_AI_DIGEST_MAX_ERRORS", "30"))
+MAX_OUTPUT_CONTENT_CHARS = int(os.getenv("X_AI_DIGEST_MAX_CONTENT_CHARS", "220"))
+MAX_TAVILY_QUERIES = int(os.getenv("X_AI_DIGEST_MAX_TAVILY_QUERIES", "8"))
+MAX_TAVILY_RESULTS = int(os.getenv("X_AI_DIGEST_MAX_TAVILY_RESULTS", "4"))
+MAX_DDGS_NEWS_QUERIES = int(os.getenv("X_AI_DIGEST_MAX_DDGS_NEWS_QUERIES", "4"))
+MAX_DDGS_TEXT_QUERIES = int(os.getenv("X_AI_DIGEST_MAX_DDGS_TEXT_QUERIES", "3"))
+MAX_HN_QUERIES = int(os.getenv("X_AI_DIGEST_MAX_HN_QUERIES", "4"))
+MAX_REDDIT_SUBREDDITS = int(os.getenv("X_AI_DIGEST_MAX_REDDIT_SUBREDDITS", "3"))
+MAX_RSS_FEEDS = int(os.getenv("X_AI_DIGEST_MAX_RSS_FEEDS", "6"))
+SOURCE_RETRY_ATTEMPTS = int(os.getenv("X_AI_DIGEST_RETRY_ATTEMPTS", "1"))
+SOURCE_RETRY_BACKOFF_SECONDS = float(os.getenv("X_AI_DIGEST_RETRY_BACKOFF_SECONDS", "1.2"))
+MIN_REVERSE_VERIFY_SECONDS = float(os.getenv("X_AI_DIGEST_MIN_REVERSE_VERIFY_SECONDS", "6"))
 
 TRUSTED_TIME_DOMAINS = {
     "arxiv.org",
@@ -190,7 +206,7 @@ DDGS_TEXT_QUERIES = [
 
 
 def _build_queries() -> list[tuple[str, str]]:
-    return list(X_ACCOUNT_QUERIES[:7]) + list(AUX_TAVILY_QUERIES)
+    return (list(X_ACCOUNT_QUERIES[:6]) + list(AUX_TAVILY_QUERIES))[: max(1, MAX_TAVILY_QUERIES)]
 
 
 def _load_tavily_key() -> str:
@@ -222,7 +238,45 @@ def _load_env_value(name: str) -> str:
     return ""
 
 
-def _safe_curl(cmd: list[str], timeout_flag: str = "20") -> subprocess.CompletedProcess[str]:
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _load_env_value(name)
+    if not raw:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _clip_text(raw: str, max_len: int = MAX_OUTPUT_CONTENT_CHARS) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    if len(text) <= max_len:
+        return text
+    return text[: max(0, max_len - 1)] + "…"
+
+
+def _time_left(deadline_ts: float) -> float:
+    return deadline_ts - time.monotonic()
+
+
+def _run_source_with_retry(
+    label: str,
+    fetcher: Callable[[], tuple[list[dict[str, Any]], list[dict[str, str]]]],
+    attempts: int = SOURCE_RETRY_ATTEMPTS,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    merged_errors: list[dict[str, str]] = []
+    max_attempts = max(1, attempts)
+    for idx in range(1, max_attempts + 1):
+        items, errs = fetcher()
+        if errs:
+            merged_errors.extend(errs)
+        if items:
+            if idx > 1:
+                merged_errors.append({"query_label": label, "error": f"recovered_after_retry_{idx}"})
+            return items, merged_errors
+        if idx < max_attempts:
+            time.sleep(SOURCE_RETRY_BACKOFF_SECONDS * idx)
+    return [], merged_errors
+
+
+def _safe_curl(cmd: list[str], timeout_flag: str = "12") -> subprocess.CompletedProcess[str]:
     clean_env = os.environ.copy()
     for k in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
         clean_env.pop(k, None)
@@ -318,7 +372,7 @@ def _snowflake_to_dt(status_id: str) -> dt.datetime | None:
         return None
 
 
-def _call_tavily(api_key: str, query: str, max_results: int = 6, days: int = 2) -> dict[str, Any]:
+def _call_tavily(api_key: str, query: str, max_results: int = MAX_TAVILY_RESULTS, days: int = 2) -> dict[str, Any]:
     payload = {
         "api_key": api_key,
         "query": query,
@@ -337,7 +391,7 @@ def _call_tavily(api_key: str, query: str, max_results: int = 6, days: int = 2) 
             "-d",
             json.dumps(payload, ensure_ascii=False),
         ],
-        timeout_flag="18",
+        timeout_flag="10",
     )
     if proc.returncode != 0:
         return {"error": f"curl_exit_{proc.returncode}", "stderr": proc.stderr.strip()}
@@ -371,7 +425,7 @@ def _call_ddgs_free_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]
                 tmp_path,
                 "-nc",
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=20)
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
             if proc.returncode != 0:
                 errors.append({"query_label": f"ddgs:{mode}:{query[:40]}", "error": f"exit_{proc.returncode}"})
                 return []
@@ -392,8 +446,8 @@ def _call_ddgs_free_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]
             except Exception:
                 pass
 
-    for q in DDGS_NEWS_QUERIES:
-        rows = _run_ddgs("news", q, max_results=8, timelimit="d")
+    for q in DDGS_NEWS_QUERIES[: max(1, MAX_DDGS_NEWS_QUERIES)]:
+        rows = _run_ddgs("news", q, max_results=5, timelimit="d")
         for row in rows:
             title = re.sub(r"\s+", " ", str(row.get("title") or "").strip())
             url = str(row.get("url") or row.get("href") or "").strip()
@@ -405,7 +459,7 @@ def _call_ddgs_free_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]
                 "source_type": "web",
                 "source_layer": "aux",
                 "title": title,
-                "content": re.sub(r"\s+", " ", str(row.get("body") or "").strip())[:600],
+                "content": _clip_text(str(row.get("body") or "")),
                 "score": 0.61,
                 "query_label": f"ddgs:news:{q}",
             }
@@ -414,8 +468,8 @@ def _call_ddgs_free_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]
                 item["category"] = _infer_category(item)
                 out.append(item)
 
-    for q in DDGS_TEXT_QUERIES:
-        rows = _run_ddgs("text", q, max_results=8, timelimit="d")
+    for q in DDGS_TEXT_QUERIES[: max(1, MAX_DDGS_TEXT_QUERIES)]:
+        rows = _run_ddgs("text", q, max_results=5, timelimit="d")
         for row in rows:
             title = re.sub(r"\s+", " ", str(row.get("title") or "").strip())
             url = str(row.get("url") or row.get("href") or "").strip()
@@ -427,7 +481,7 @@ def _call_ddgs_free_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]
                 "source_type": "web",
                 "source_layer": "aux",
                 "title": title,
-                "content": re.sub(r"\s+", " ", str(row.get("body") or "").strip())[:600],
+                "content": _clip_text(str(row.get("body") or "")),
                 "score": 0.56,
                 "query_label": f"ddgs:text:{q}",
             }
@@ -482,7 +536,7 @@ def _pick_items(resp: dict[str, Any], label: str) -> list[dict[str, Any]]:
     for row in resp.get("results", []) or []:
         url = str(row.get("url") or "").strip()
         title = re.sub(r"\s+", " ", str(row.get("title") or "").strip())
-        content = re.sub(r"\s+", " ", str(row.get("content") or "").strip())
+        content = _clip_text(str(row.get("content") or ""))
 
         item: dict[str, Any] = {
             "url": url,
@@ -658,7 +712,7 @@ async def _primary_from_twscrape() -> tuple[list[dict[str, Any]], list[dict[str,
 def _call_github_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     since = (dt.datetime.now(tz=UTC) - dt.timedelta(days=4)).date().isoformat()
     q = f"(topic:ai OR topic:llm OR topic:agent OR topic:multimodal) pushed:>={since} stars:>10"
-    qs = urlencode({"q": q, "sort": "updated", "order": "desc", "per_page": 40})
+    qs = urlencode({"q": q, "sort": "updated", "order": "desc", "per_page": 28})
     url = f"https://api.github.com/search/repositories?{qs}"
 
     headers = [
@@ -673,7 +727,7 @@ def _call_github_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     if token:
         headers.extend(["-H", f"Authorization: Bearer {token}"])
 
-    proc = _safe_curl([*headers, url], timeout_flag="22")
+    proc = _safe_curl([*headers, url], timeout_flag="10")
     if proc.returncode != 0:
         return [], [{"query_label": "github", "error": f"curl_exit_{proc.returncode}"}]
 
@@ -696,7 +750,7 @@ def _call_github_search() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
             "source_type": "github",
             "source_layer": "aux",
             "title": str(repo.get("full_name") or "").strip(),
-            "content": re.sub(r"\s+", " ", str(repo.get("description") or "").strip()),
+            "content": _clip_text(str(repo.get("description") or "")),
             "score": min(1.0, math.log1p(float(repo.get("stargazers_count") or 0)) / 8.0),
             "query_label": "github:hot_new",
             "stars": int(repo.get("stargazers_count") or 0),
@@ -864,7 +918,7 @@ def _call_arxiv_recent() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         "https://export.arxiv.org/api/query?"
         f"search_query={query}&start=0&max_results=30&sortBy=submittedDate&sortOrder=descending"
     )
-    proc = _safe_curl([url], timeout_flag="20")
+    proc = _safe_curl([url], timeout_flag="10")
     if proc.returncode != 0:
         return [], [{"query_label": "arxiv", "error": f"curl_exit_{proc.returncode}"}]
 
@@ -892,7 +946,7 @@ def _call_arxiv_recent() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
             "source_type": "paper",
             "source_layer": "aux",
             "title": title,
-            "content": summary[:500],
+            "content": _clip_text(summary),
             "score": 0.76,
             "query_label": "paper:arxiv_recent",
         }
@@ -913,10 +967,10 @@ def _call_hn_recent() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     ]
     out: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-    for q in queries:
+    for q in queries[: max(1, MAX_HN_QUERIES)]:
         qs = urlencode({"query": q, "tags": "story", "hitsPerPage": 20})
         url = f"https://hn.algolia.com/api/v1/search_by_date?{qs}"
-        proc = _safe_curl([url], timeout_flag="16")
+        proc = _safe_curl([url], timeout_flag="8")
         if proc.returncode != 0:
             errors.append({"query_label": f"hn:{q}", "error": f"curl_exit_{proc.returncode}"})
             continue
@@ -941,7 +995,7 @@ def _call_hn_recent() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
                 "source_type": "web",
                 "source_layer": "aux",
                 "title": title,
-                "content": re.sub(r"\s+", " ", str(hit.get("story_text") or "").strip()),
+                "content": _clip_text(str(hit.get("story_text") or "")),
                 "score": min(1.0, math.log1p(float(hit.get("points") or 0)) / 8.0),
                 "query_label": f"hn:{q}",
             }
@@ -967,9 +1021,9 @@ def _call_reddit_ai_recent() -> tuple[list[dict[str, Any]], list[dict[str, str]]
         "Accept: application/json",
     ]
 
-    for sub in subreddits:
+    for sub in subreddits[: max(1, MAX_REDDIT_SUBREDDITS)]:
         url = f"https://www.reddit.com/r/{sub}/new.json?limit=30"
-        proc = _safe_curl([*headers, url], timeout_flag="16")
+        proc = _safe_curl([*headers, url], timeout_flag="8")
         if proc.returncode != 0:
             errors.append({"query_label": f"reddit:{sub}", "error": f"curl_exit_{proc.returncode}"})
             continue
@@ -1003,7 +1057,7 @@ def _call_reddit_ai_recent() -> tuple[list[dict[str, Any]], list[dict[str, str]]
                 "source_type": "web",
                 "source_layer": "aux",
                 "title": title,
-                "content": re.sub(r"\s+", " ", str(node.get("selftext") or "").strip())[:500],
+                "content": _clip_text(str(node.get("selftext") or "")),
                 "score": min(1.0, math.log1p(float(node.get("score") or 0)) / 8.0),
                 "query_label": f"reddit:{sub}",
             }
@@ -1031,8 +1085,8 @@ def _call_ai_rss_feeds() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     out: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 
-    for label, url in feeds:
-        proc = _safe_curl([url], timeout_flag="18")
+    for label, url in feeds[: max(1, MAX_RSS_FEEDS)]:
+        proc = _safe_curl([url], timeout_flag="8")
         if proc.returncode != 0:
             errors.append({"query_label": f"rss:{label}", "error": f"curl_exit_{proc.returncode}"})
             continue
@@ -1058,7 +1112,7 @@ def _call_ai_rss_feeds() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
             )
             title = _strip_xml_text(t.group(1) if t else "")
             link = _strip_xml_text(l.group(1) if l else "")
-            desc_text = _strip_xml_text(desc.group(1) if desc else "")[:500]
+            desc_text = _clip_text(_strip_xml_text(desc.group(1) if desc else ""))
             event_dt = _parse_any_datetime(d.group(1) if d else "")
 
             if not title or not link:
@@ -1206,6 +1260,7 @@ def _rank_and_filter(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     now = dt.datetime.now(tz=BJT)
     seen: set[str] = set()
     kept: list[dict[str, Any]] = []
+    fallback_unverified: list[dict[str, Any]] = []
 
     dropped_no_time = 0
     dropped_old = 0
@@ -1249,6 +1304,17 @@ def _rank_and_filter(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
                 pass
             else:
                 dropped_unverified += 1
+                recency_bonus = max(0.0, MAX_AGE_HOURS - age_h) / MAX_AGE_HOURS
+                source_bonus = {
+                    "x": 0.10,
+                    "paper": 0.10,
+                    "github": 0.08,
+                    "web": 0.04,
+                }.get(src_type, 0.0)
+                layer_bonus = 0.06 if str(item.get("source_layer") or "") == "main" else 0.0
+                item["age_hours"] = round(age_h, 2)
+                item["_rank"] = float(item.get("score", 0.0)) * 0.58 + recency_bonus * 0.34 + source_bonus + layer_bonus
+                fallback_unverified.append(item)
                 continue
 
         recency_bonus = max(0.0, MAX_AGE_HOURS - age_h) / MAX_AGE_HOURS
@@ -1295,6 +1361,16 @@ def _rank_and_filter(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
         cat = str(item.get("category") or "未分类")
         category_stats[cat] = category_stats.get(cat, 0) + 1
 
+    relaxed_mode = False
+    if not balanced and fallback_unverified:
+        fallback_unverified.sort(key=lambda x: (x.get("_rank", 0.0), x.get("filter_time_iso", "")), reverse=True)
+        balanced = fallback_unverified[:8]
+        relaxed_mode = True
+        category_stats = {}
+        for item in balanced:
+            cat = str(item.get("category") or "未分类")
+            category_stats[cat] = category_stats.get(cat, 0) + 1
+
     stats: dict[str, Any] = {
         "dropped_no_time": dropped_no_time,
         "dropped_outside_48h": dropped_old,
@@ -1303,6 +1379,7 @@ def _rank_and_filter(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
         "dropped_irrelevant": dropped_irrelevant,
         "kept_after_48h_filter": len(balanced),
         "category_distribution": category_stats,
+        "relaxed_mode_unverified_fallback": relaxed_mode,
     }
     return balanced, stats
 
@@ -1440,25 +1517,78 @@ def _build_modules(top: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     }
 
 
+def _compact_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": str(item.get("title") or ""),
+        "source": str(item.get("source") or ""),
+        "source_type": str(item.get("source_type") or ""),
+        "category": str(item.get("category") or ""),
+        "beijing_time": str(item.get("beijing_time") or ""),
+        "url": str(item.get("url") or ""),
+        "score": _safe_round(float(item.get("score") or 0.0)),
+        "age_hours": float(item.get("age_hours") or 0.0),
+        "cross_verified": bool(item.get("cross_verified")),
+        "time_filter_basis": str(item.get("time_filter_basis") or ""),
+        "summary": _clip_text(str(item.get("content") or ""), max_len=140),
+    }
+
+
+def _compact_errors(errors: list[dict[str, Any]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for e in errors[: max(1, MAX_OUTPUT_ERRORS)]:
+        if not isinstance(e, dict):
+            continue
+        out.append(
+            {
+                "query_label": _clip_text(str(e.get("query_label") or ""), max_len=60),
+                "error": _clip_text(str(e.get("error") or ""), max_len=180),
+            }
+        )
+    return out
+
+
 def main() -> int:
+    started_at = time.monotonic()
+    deadline = started_at + MAX_RUNTIME_SECONDS
     query_pack = _build_queries()
     errors: list[dict[str, str]] = []
     all_items: list[dict[str, Any]] = []
+    skipped_stages: list[str] = []
 
-    twikit_items, twikit_errors = asyncio.run(_primary_from_twikit())
-    all_items.extend(twikit_items)
-    errors.extend(twikit_errors)
+    def _budget_ok(stage: str, min_left: float = 0.0) -> bool:
+        if _time_left(deadline) > min_left:
+            return True
+        if stage not in skipped_stages:
+            skipped_stages.append(stage)
+        errors.append({"query_label": f"budget:{stage}", "error": f"runtime_budget_exceeded(min_left={min_left})"})
+        return False
 
-    twscrape_items, twscrape_errors = asyncio.run(_primary_from_twscrape())
-    all_items.extend(twscrape_items)
-    errors.extend(twscrape_errors)
+    x_scrapers_enabled = _env_bool("ENABLE_X_SCRAPERS", ENABLE_X_SCRAPERS_DEFAULT)
+    if x_scrapers_enabled and _budget_ok("x_scrapers:twikit", min_left=20):
+        twikit_items, twikit_errors = asyncio.run(_primary_from_twikit())
+        all_items.extend(twikit_items)
+        errors.extend(twikit_errors)
+
+        if _budget_ok("x_scrapers:twscrape", min_left=14):
+            twscrape_items, twscrape_errors = asyncio.run(_primary_from_twscrape())
+            all_items.extend(twscrape_items)
+            errors.extend(twscrape_errors)
 
     tavily_key = _load_tavily_key()
     tavily_used = False
     ddgs_used = False
-    if tavily_key:
+    if tavily_key and _budget_ok("tavily", min_left=24):
         for label, query in query_pack:
-            resp = _call_tavily(tavily_key, query, max_results=6, days=2)
+            if not _budget_ok(f"tavily:{label}", min_left=5):
+                break
+            resp: dict[str, Any] | None = None
+            for attempt in range(1, max(1, SOURCE_RETRY_ATTEMPTS) + 1):
+                resp = _call_tavily(tavily_key, query, max_results=MAX_TAVILY_RESULTS, days=2)
+                if not resp.get("error"):
+                    break
+                if attempt < SOURCE_RETRY_ATTEMPTS and _time_left(deadline) > SOURCE_RETRY_BACKOFF_SECONDS:
+                    time.sleep(SOURCE_RETRY_BACKOFF_SECONDS * attempt)
+            assert resp is not None
             if resp.get("error"):
                 errors.append({"query_label": f"tavily:{label}", "error": str(resp.get("error"))})
                 continue
@@ -1467,35 +1597,48 @@ def main() -> int:
     else:
         errors.append({"query_label": "tavily", "error": "missing_tavily_api_key"})
 
-    ddgs_items, ddgs_errors, ddgs_used = _call_ddgs_free_search()
-    all_items.extend(ddgs_items)
-    errors.extend(ddgs_errors)
+    if _budget_ok("ddgs", min_left=16):
+        ddgs_items, ddgs_errors, ddgs_used = _call_ddgs_free_search()
+        all_items.extend(ddgs_items)
+        errors.extend(ddgs_errors)
 
-    github_items, github_errors = _call_github_search()
-    all_items.extend(github_items)
-    errors.extend(github_errors)
+    if _budget_ok("github", min_left=8):
+        github_items, github_errors = _run_source_with_retry("github", _call_github_search)
+        all_items.extend(github_items)
+        errors.extend(github_errors)
 
-    arxiv_items, arxiv_errors = _call_arxiv_recent()
-    all_items.extend(arxiv_items)
-    errors.extend(arxiv_errors)
+    if _budget_ok("arxiv", min_left=8):
+        arxiv_items, arxiv_errors = _run_source_with_retry("arxiv", _call_arxiv_recent)
+        all_items.extend(arxiv_items)
+        errors.extend(arxiv_errors)
 
-    hn_items, hn_errors = _call_hn_recent()
-    all_items.extend(hn_items)
-    errors.extend(hn_errors)
+    if _budget_ok("hn", min_left=10):
+        hn_items, hn_errors = _run_source_with_retry("hn", _call_hn_recent)
+        all_items.extend(hn_items)
+        errors.extend(hn_errors)
 
-    reddit_items, reddit_errors = _call_reddit_ai_recent()
-    all_items.extend(reddit_items)
-    errors.extend(reddit_errors)
+    if _budget_ok("reddit", min_left=10):
+        reddit_items, reddit_errors = _run_source_with_retry("reddit", _call_reddit_ai_recent)
+        all_items.extend(reddit_items)
+        errors.extend(reddit_errors)
 
-    rss_items, rss_errors = _call_ai_rss_feeds()
-    all_items.extend(rss_items)
-    errors.extend(rss_errors)
+    if _budget_ok("rss", min_left=8):
+        rss_items, rss_errors = _run_source_with_retry("rss", _call_ai_rss_feeds)
+        all_items.extend(rss_items)
+        errors.extend(rss_errors)
 
-    reverse_checked, reverse_shifted = _reverse_verify_origin_time(all_items, tavily_key, errors)
+    reverse_checked = 0
+    reverse_shifted = 0
+    if _budget_ok("reverse_verify", min_left=MIN_REVERSE_VERIFY_SECONDS) and _time_left(deadline) >= MIN_REVERSE_VERIFY_SECONDS:
+        reverse_checked, reverse_shifted = _reverse_verify_origin_time(all_items, tavily_key, errors)
+    else:
+        errors.append({"query_label": "reverse_verify", "error": "skipped_due_to_runtime_budget"})
 
     ranked, filter_stats = _rank_and_filter(all_items)
-    top = ranked[:36]
-    modules = _build_modules(top)
+    top = ranked[: max(1, MAX_OUTPUT_ITEMS)]
+    modules_raw = _build_modules(top)
+    modules = {k: [_compact_item(x) for x in v] for k, v in modules_raw.items()}
+    top_compact = [_compact_item(x) for x in top]
     generated_iso = dt.datetime.now(tz=BJT).isoformat(timespec="seconds")
     generated_bj = dt.datetime.now(tz=BJT).strftime("%Y-%m-%d %H:%M:%S")
     learning_input_stats = {
@@ -1503,16 +1646,24 @@ def main() -> int:
         "raw_collected": len(all_items),
         "after_filter": len(ranked),
     }
-    learning = _build_learning_report(generated_iso, learning_input_stats, top, modules, errors)
+    learning = _build_learning_report(generated_iso, learning_input_stats, top, modules_raw, errors)
+    elapsed = round(time.monotonic() - started_at, 2)
+    trimmed_errors = _compact_errors(errors)
 
     out = {
         "ok": True,
         "generated_at_bj": generated_bj,
         "generated_at_iso": generated_iso,
-        "source": "multi_source_ai_digest_v7",
+        "source": "multi_source_ai_digest_v8-lite",
+        "runtime_guard": {
+            "max_runtime_seconds": MAX_RUNTIME_SECONDS,
+            "elapsed_seconds": elapsed,
+            "timed_out": bool(skipped_stages),
+            "skipped_stages": skipped_stages,
+        },
         "architecture": {
             "mode": "one-main-many-aux",
-            "main": ["x_twikit", "x_twscrape"],
+            "main": ["tavily_web", "ddgs_free_search"],
             "aux": [
                 "tavily_web",
                 "ddgs_free_search",
@@ -1522,13 +1673,7 @@ def main() -> int:
                 "reddit_new",
                 "rss_media_expanded",
             ],
-            "official_skills_enabled": [
-                "duckduckgo-search",
-                "domain-intel",
-                "blogwatcher",
-                "scrapling",
-                "parallel-cli(optional)",
-            ],
+            "x_scrapers_enabled": x_scrapers_enabled,
         },
         "time_filter_policy": {
             "timezone": "Asia/Shanghai",
@@ -1552,10 +1697,10 @@ def main() -> int:
             "query_count": len(query_pack),
             **filter_stats,
         },
-        "errors": errors,
+        "errors": trimmed_errors,
         "learning": learning,
         "modules": modules,
-        "items": top,
+        "items": top_compact,
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0

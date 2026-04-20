@@ -1,7 +1,7 @@
 ---
 name: hermes-ai-digest
 description: Build a strict 48-hour, multi-source overseas AI intelligence digest for Hermes with cross-verification, modular output, WeChat/email delivery, and self-learning trend feedback.
-version: 1.0.0
+version: 1.1.0
 author: Apple + Codex
 license: MIT
 metadata:
@@ -12,7 +12,7 @@ metadata:
 
 # Hermes AI Digest Skill
 
-Use this skill when user asks to run a daily/periodic AI intelligence digest with strict recency filtering, cross-source checks, and multi-channel delivery.
+Use this skill when user asks to run a daily/periodic AI intelligence digest with strict recency filtering, cross-source checks, and stable delivery under network/time-limit pressure.
 
 ## What this skill provides
 
@@ -43,9 +43,15 @@ Use this skill when user asks to run a daily/periodic AI intelligence digest wit
 - compare current run vs 7-run baseline
 - output progress signals and next optimization actions
 
+5. Runtime guard + token optimization:
+- watchdog wrapper retries when timeout/failure happens
+- runtime budget guard avoids long stalls
+- compact output payload reduces downstream generation cost
+
 ## Files
 
 - `scripts/x_ai_tavily_digest.py`: main collector and ranker
+- `scripts/x_ai_tavily_digest_guarded.py`: watchdog wrapper with timeout/retry
 
 ## Usage
 
@@ -55,9 +61,15 @@ Run script directly:
 python3 scripts/x_ai_tavily_digest.py > digest.json
 ```
 
+Recommended for cron:
+
+```bash
+python3 scripts/x_ai_tavily_digest_guarded.py > digest.json
+```
+
 Use in Hermes cron job:
 
-- set `script: x_ai_tavily_digest.py`
+- set `script: x_ai_tavily_digest_guarded.py`
 - render markdown digest from injected JSON fields: `modules`, `items`, `learning`, `collection_stats`
 
 ## Required environment
@@ -76,6 +88,14 @@ Optional (for richer X data):
 
 Optional:
 - `GITHUB_TOKEN`
+
+Runtime tuning (optional):
+- `X_AI_DIGEST_MAX_RUNTIME_SECONDS`
+- `X_AI_DIGEST_MAX_ITEMS`
+- `X_AI_DIGEST_MAX_CONTENT_CHARS`
+- `X_AI_DIGEST_MAX_TAVILY_QUERIES`
+- `X_AI_DIGEST_MAX_DDGS_NEWS_QUERIES`
+- `X_AI_DIGEST_MAX_DDGS_TEXT_QUERIES`
 
 ## Delivery recommendation
 
